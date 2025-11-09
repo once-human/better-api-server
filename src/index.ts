@@ -14,7 +14,7 @@ const app = new Hono<{ Bindings: Bindings }>();
 app.use(
   '*',
   cors({
-    origin: '*', // tighten to your app domains in prod
+    origin: '*', // lock to your domains in prod
     allowMethods: ['POST', 'GET', 'OPTIONS'],
     allowHeaders: ['Content-Type', 'X-Client-Id'],
   })
@@ -24,7 +24,7 @@ app.use(
 async function rateLimit(env: Bindings, id: string) {
   const bucket = `rl:${id || 'anon'}:${Math.floor(Date.now() / 600000)}`; // 10-min window
   const current = parseInt((await env.RATE_KV.get(bucket)) ?? '0', 10) + 1;
-  await env.RATE_KV.put(bucket, String(current), { expirationTtl: 660 });
+  await env.RATE_KV.put(bucket, String(current), { expirationTtl: 660 }); // >=60 required
   return current <= 60; // 60 req / 10 min
 }
 
@@ -72,7 +72,8 @@ async function callGroq(env: Bindings, body: any) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      model: body?.model ?? 'llama-3.1-70b-versatile',
+      // FIX: use a current model (old one is decommissioned)
+      model: body?.model ?? 'llama-3.3-70b-versatile',
       messages: body?.messages ?? [],
       temperature: body?.temperature ?? 0.7,
       max_tokens: body?.max_tokens,
@@ -96,8 +97,9 @@ async function callGroq(env: Bindings, body: any) {
 async function callGemini(env: Bindings, body: any) {
   if (!env.GEMINI_API_KEY) throw new Error('gemini_key_missing');
 
-  const model = encodeURIComponent(body?.model ?? 'gemini-1.5-pro');
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
+  // FIX: use v1 endpoint + current model
+  const model = encodeURIComponent(body?.model ?? 'gemini-2.5-pro');
+  const url = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
   const gemBody = openAIToGeminiBody(body);
 
   const res = await fetch(url, {
@@ -127,7 +129,8 @@ app.get('/health', async (c) => {
   const out: any = { ok: true };
 
   try {
-    await c.env.RATE_KV.put('health', '1', { expirationTtl: 30 });
+    // FIX: TTL must be >= 60
+    await c.env.RATE_KV.put('health', '1', { expirationTtl: 60 });
     out.kv = 'ok';
   } catch (e) {
     out.kv = 'error';
@@ -147,7 +150,7 @@ app.get('/health', async (c) => {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify({
-          model: 'llama-3.1-70b-versatile',
+          model: 'llama-3.3-70b-versatile',
           messages: [{ role: 'user', content: 'ping' }],
         }),
       });
@@ -160,7 +163,7 @@ app.get('/health', async (c) => {
 
   if (c.env.GEMINI_API_KEY) {
     try {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:generateContent?key=${c.env.GEMINI_API_KEY}`;
+      const url = `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-pro:generateContent?key=${c.env.GEMINI_API_KEY}`;
       const r = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
