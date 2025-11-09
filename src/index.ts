@@ -20,16 +20,49 @@ app.use(
   })
 );
 
+// ---------- Config / Priorities ----------
+const GROQ_SPEED_PRIORITY = [
+  'llama-3.1-8b-instant',
+  'llama-3.2-11b-vision',
+  'llama-3.2-3b-instruct',
+  'llama-3.3-70b-versatile', // fallback to quality if speed SKUs missing
+];
+const GROQ_QUALITY_PRIORITY = [
+  'llama-3.3-70b-versatile',
+  'llama-3.1-70b-versatile',
+  'llama-3.1-8b-instant',
+];
+
+const GEMINI_SPEED_PRIORITY = [
+  'gemini-2.5-flash-lite',
+  'gemini-2.5-flash',
+  'gemini-2.0-flash',
+  'gemini-2.5-pro', // fallback to quality if flashes missing
+];
+const GEMINI_QUALITY_PRIORITY = [
+  'gemini-2.5-pro',
+  'gemini-2.0-pro',
+  'gemini-2.5-flash',
+];
+
+type Preset = 'speed' | 'quality';
+
 // ---------- Helpers ----------
 async function rateLimit(env: Bindings, id: string) {
   const bucket = `rl:${id || 'anon'}:${Math.floor(Date.now() / 600000)}`; // 10-min window
   const current = parseInt((await env.RATE_KV.get(bucket)) ?? '0', 10) + 1;
-  await env.RATE_KV.put(bucket, String(current), { expirationTtl: 660 }); // >=60 required
+  await env.RATE_KV.put(bucket, String(current), { expirationTtl: 660 }); // TTL >= 60
   return current <= 60; // 60 req / 10 min
 }
 
 function toOpenAIResponse(text: string) {
   return { choices: [{ message: { content: text } }] };
+}
+
+function isDecommissionedHttp(status: number, body: string) {
+  if (status === 404) return true;
+  if (status === 400 && /model.*(decommissioned|not found)/i.test(body)) return true;
+  return false;
 }
 
 // Map OpenAI-style messages -> Gemini "contents"
@@ -61,30 +94,94 @@ function openAIToGeminiBody(body: any) {
   return { contents, generationConfig };
 }
 
-// ---------- Providers ----------
-async function callGroq(env: Bindings, body: any) {
+// ---------- Live model discovery ----------
+async function listGroqModels(apiKey: string): Promise<string[]> {
+  const r = await fetch('https://api.groq.com/openai/v1/models', {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  if (!r.ok) return [];
+  const j = await r.json().catch(() => ({}));
+  const ids: string[] = Array.isArray(j?.data)
+    ? j.data.map((m: any) => m?.id).filter((s: any) => typeof s === 'string')
+    : [];
+  return ids;
+}
+
+async function listGeminiModels(apiKey: string): Promise<string[]> {
+  const r = await fetch(`https://generativelanguage.googleapis.com/v1/models?key=${apiKey}`);
+  if (!r.ok) return [];
+  const j = await r.json().catch(() => ({}));
+  const ids: string[] = Array.isArray(j?.models)
+    ? j.models.map((m: any) => m?.name).filter((s: any) => typeof s === 'string')
+    : [];
+  // names are like "models/gemini-2.5-pro" -> normalize to "gemini-2.5-pro"
+  return ids.map((s) => s.replace(/^models\//, ''));
+}
+
+function pickFirstAvailable(priority: string[], available: string[]): string | null {
+  for (const p of priority) if (available.includes(p)) return p;
+  return null;
+}
+
+// ---------- Providers (with auto model selection) ----------
+async function resolveGroqModel(env: Bindings, requested: string | undefined, preset: Preset) {
+  const available = await listGroqModels(env.GROQ_API_KEY!);
+  if (requested && available.includes(requested)) return requested;
+  const priority = preset === 'quality' ? GROQ_QUALITY_PRIORITY : GROQ_SPEED_PRIORITY;
+  return pickFirstAvailable(priority, available) ?? (available[0] || 'llama-3.1-8b-instant');
+}
+
+async function resolveGeminiModel(env: Bindings, requested: string | undefined, preset: Preset) {
+  const available = await listGeminiModels(env.GEMINI_API_KEY!);
+  if (requested && available.includes(requested)) return requested;
+  const priority = preset === 'quality' ? GEMINI_QUALITY_PRIORITY : GEMINI_SPEED_PRIORITY;
+  return pickFirstAvailable(priority, available) ?? (available[0] || 'gemini-2.5-flash');
+}
+
+async function callGroq(env: Bindings, body: any, preset: Preset) {
   if (!env.GROQ_API_KEY) throw new Error('groq_key_missing');
 
-  const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+  let model = await resolveGroqModel(env, body?.model, preset);
+  const req = {
+    model,
+    messages: body?.messages ?? [],
+    temperature: body?.temperature ?? 0.7,
+    max_tokens: body?.max_tokens,
+    stream: false,
+  };
+
+  let res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${env.GROQ_API_KEY}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      // FIX: use a current model (old one is decommissioned)
-      model: body?.model ?? 'llama-3.3-70b-versatile',
-      messages: body?.messages ?? [],
-      temperature: body?.temperature ?? 0.7,
-      max_tokens: body?.max_tokens,
-      stream: false,
-    }),
+    body: JSON.stringify(req),
   });
 
   if (!res.ok) {
     const t = await res.text().catch(() => '');
-    throw new Error(`groq_http_${res.status}:${t}`);
+    // If the requested model was invalid/decommissioned, retry with fresh resolution
+    if (isDecommissionedHttp(res.status, t)) {
+      model = await resolveGroqModel(env, undefined, preset);
+      const retryReq = { ...req, model };
+      res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${env.GROQ_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(retryReq),
+      });
+      if (!res.ok) {
+        const t2 = await res.text().catch(() => '');
+        throw new Error(`groq_http_${res.status}:${t2}`);
+      }
+    } else {
+      throw new Error(`groq_http_${res.status}:${t}`);
+    }
   }
+
   const json: any = await res.json().catch((e) => {
     throw new Error(`groq_json:${String(e)}`);
   });
@@ -94,15 +191,15 @@ async function callGroq(env: Bindings, body: any) {
   return toOpenAIResponse(txt);
 }
 
-async function callGemini(env: Bindings, body: any) {
+async function callGemini(env: Bindings, body: any, preset: Preset) {
   if (!env.GEMINI_API_KEY) throw new Error('gemini_key_missing');
 
-  // FIX: use v1 endpoint + current model
-  const model = encodeURIComponent(body?.model ?? 'gemini-2.5-pro');
-  const url = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent?key=${env.GEMINI_API_KEY}`;
+  let model = await resolveGeminiModel(env, body?.model, preset);
+  const url = (m: string) =>
+    `https://generativelanguage.googleapis.com/v1/models/${encodeURIComponent(m)}:generateContent?key=${env.GEMINI_API_KEY}`;
   const gemBody = openAIToGeminiBody(body);
 
-  const res = await fetch(url, {
+  let res = await fetch(url(model), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(gemBody),
@@ -110,8 +207,22 @@ async function callGemini(env: Bindings, body: any) {
 
   if (!res.ok) {
     const t = await res.text().catch(() => '');
-    throw new Error(`gemini_http_${res.status}:${t}`);
+    if (isDecommissionedHttp(res.status, t)) {
+      model = await resolveGeminiModel(env, undefined, preset);
+      res = await fetch(url(model), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(gemBody),
+      });
+      if (!res.ok) {
+        const t2 = await res.text().catch(() => '');
+        throw new Error(`gemini_http_${res.status}:${t2}`);
+      }
+    } else {
+      throw new Error(`gemini_http_${res.status}:${t}`);
+    }
   }
+
   const json: any = await res.json().catch((e) => {
     throw new Error(`gemini_json:${String(e)}`);
   });
@@ -119,7 +230,6 @@ async function callGemini(env: Bindings, body: any) {
   const parts = json?.candidates?.[0]?.content?.parts;
   const txt =
     Array.isArray(parts) ? parts.map((p: any) => p?.text ?? '').filter(Boolean).join('\n').trim() : '';
-
   if (!txt) throw new Error('gemini_empty');
   return toOpenAIResponse(txt);
 }
@@ -129,7 +239,6 @@ app.get('/health', async (c) => {
   const out: any = { ok: true };
 
   try {
-    // FIX: TTL must be >= 60
     await c.env.RATE_KV.put('health', '1', { expirationTtl: 60 });
     out.kv = 'ok';
   } catch (e) {
@@ -140,43 +249,7 @@ app.get('/health', async (c) => {
   out.groq_secret = !!c.env.GROQ_API_KEY;
   out.gemini_secret = !!c.env.GEMINI_API_KEY;
 
-  // Light provider probes (don’t block if they fail)
-  if (c.env.GROQ_API_KEY) {
-    try {
-      const r = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${c.env.GROQ_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: 'llama-3.3-70b-versatile',
-          messages: [{ role: 'user', content: 'ping' }],
-        }),
-      });
-      out.groq_status = r.status;
-      if (!r.ok) out.groq_body = await r.text();
-    } catch (e) {
-      out.groq_error = String(e);
-    }
-  }
-
-  if (c.env.GEMINI_API_KEY) {
-    try {
-      const url = `https://generativelanguage.googleapis.com/v1/models/gemini-2.5-pro:generateContent?key=${c.env.GEMINI_API_KEY}`;
-      const r = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: 'ping' }] }],
-        }),
-      });
-      out.gemini_status = r.status;
-      if (!r.ok) out.gemini_body = await r.text();
-    } catch (e) {
-      out.gemini_error = String(e);
-    }
-  }
+  // Optional light pings removed to keep health quick & cheap.
 
   return c.json(out);
 });
@@ -193,11 +266,11 @@ app.post('/v1/chat', async (c) => {
 
     const body = await c.req.json();
     const provider = (body?.provider ?? 'auto') as 'auto' | 'groq' | 'gemini';
-    const fallback = Boolean(body?.enable_fallback ?? true);
+    const preset: Preset = (body?.preset === 'quality' ? 'quality' : 'speed');
 
     if (provider === 'groq') {
       try {
-        return c.json(await callGroq(env, body));
+        return c.json(await callGroq(env, body, preset));
       } catch (e) {
         return c.json({ error: `groq_failed:${String(e)}` }, 502);
       }
@@ -205,7 +278,7 @@ app.post('/v1/chat', async (c) => {
 
     if (provider === 'gemini') {
       try {
-        return c.json(await callGemini(env, body));
+        return c.json(await callGemini(env, body, preset));
       } catch (e) {
         return c.json({ error: `gemini_failed:${String(e)}` }, 502);
       }
@@ -213,12 +286,12 @@ app.post('/v1/chat', async (c) => {
 
     // auto: Groq → Gemini fallback
     try {
-      const out = await callGroq(env, body);
+      const out = await callGroq(env, body, preset);
       return c.json(out);
     } catch (e1) {
-      if (fallback && env.GEMINI_API_KEY) {
+      if (env.GEMINI_API_KEY) {
         try {
-          const out = await callGemini(env, body);
+          const out = await callGemini(env, body, preset);
           return c.json(out);
         } catch (e2) {
           return c.json({ error: `fallback_failed:${String(e2)}` }, 500);
