@@ -1,0 +1,14 @@
+{
+  "name": "better-ai-proxy",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "3.81.0"
+  },
+  "dependencies": {
+    "hono": "4.6.8"
+  }
+}

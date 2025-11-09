@@ -1,0 +1,7 @@
+name = "better-ai-proxy"
+main = "src/index.ts"
+compatibility_date = "2024-11-01"
+
+[[kv_namespaces]]
+binding = "RATE_KV"
+id = "c7861e1dc2d346aa80aff888f398d399" # paste your RATE_KV id here
