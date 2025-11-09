@@ -8,7 +8,6 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
     permissions:
       contents: read
 
@@ -30,6 +29,11 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: deploy
+          # The action will "wrangler secret put" for each name listed here,
+          # reading the value from the step's ENV (defined below).
           secrets: |
             GROQ_API_KEY
             GEMINI_API_KEY
+        env:
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
